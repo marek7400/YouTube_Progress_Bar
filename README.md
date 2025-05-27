@@ -4,5 +4,6 @@ YouTube Progress Bar - Chrome extension
 
 Installation:
 Unzip to a folder, click “Load Unzipped” and point to the folder.
+If you not see bar try on/off extension.
 
 ![installation](image/installation.png)
