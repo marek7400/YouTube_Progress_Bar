@@ -5,8 +5,9 @@ YouTube Progress Bar - Chrome extension
 Installation:
 Unzip to a folder, click “Load Unzipped” and point to the folder.
 
-If you use "Tweaks for YouTube" set in settings 'Player Controls' to 'Progress bar' 
+Conflicts with other extensions:
+If you use "Tweaks for YouTube" extension - set in settings 'Player Controls' to 'Progress bar' 
 
-If you not see bar play and try on/off extension. (Opera)
+If you not see bar-click play and try on/off extension. (Opera)
 
 ![installation](image/installation.png)
