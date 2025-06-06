@@ -1,102 +1,23 @@
 // ==UserScript==
-// @name         YouTube Progress Bar (Tampermonkey)
+// @name         YouTube Custom Progress Bar
 // @namespace    http://tampermonkey.net/
-// @version      1.1.1_TM_v15_final_cleanup
-// @description  Adds a customizable progress bar at the bottom of YouTube videos. Includes chapter markers.
+// @version      1.2
+// @description  Adds a customizable progress bar at the bottom of YouTube videos, adapted from the extension.
 // @author       marek7400
 // @match        https://www.youtube.com/*
-// @match        *://*.youtube-nocookie.com/*
-// @match        *://youtube-nocookie.com/*
-// @grant        GM_getValue
+// @match        https://www.youtube-nocookie.com/embed/*
 // @grant        GM_setValue
-// @grant        GM_addValueChangeListener
-// @grant        GM_registerMenuCommand
+// @grant        GM_getValue
 // @grant        GM_addStyle
-// @run-at       document-idle
+// @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
+// @run-at       document-start
 // ==/UserScript==
 
 (function() {
     'use strict';
 
-    console.log("YTPB Main (v15_final_cleanup): Initializing.");
-
-    // --- Message Listener (Simplified condition from v14) ---
-    window.addEventListener('message', function(event) {
-        if (event.data && typeof event.data.type === 'string') {
-            if (event.data.type === 'FROM_PAGE_SCRIPT_CHAPTER_DATA_YTPB') {
-                // console.log('YTPB Main (v15): Received chapter data.'); // Optional: keep for light debugging
-                try {
-                    processChapterData(event.data);
-                } catch (e) {
-                    console.error("YTPB Main (v15): ERROR during processChapterData!", e);
-                }
-            }
-            // Można tu dodać obsługę 'YTPB_INJECTOR_ALIVE_TEST_PM' jeśli chcesz zachować ten test
-        }
-    });
-    // --- End of Message Listener ---
-
-
-    // --- Start: Injector.js logic (Cleaned up from v14) ---
-    const injectorScriptCode = `
-        (function() {
-          // console.log('YTPB INJECTOR (v15): Script Injected.'); // Optional injector start log
-
-          // Test message to confirm injector is alive and can postMessage
-          // try { window.postMessage({ type: 'YTPB_INJECTOR_ALIVE_TEST_PM', timestamp: Date.now() }, '*'); } catch (e) { /* silent */ }
-
-          window.addEventListener('message', function(event) {
-            if (event.source === window && event.data && event.data.type === 'REQUEST_CHAPTER_DATA_YTPB_FROM_CONTENT') {
-              // console.log('YTPB INJECTOR (v15): Received chapter data request.'); // Optional
-              getPlayerDataWithRetry((videoData) => {
-                if (videoData && videoData.videoDetails) {
-                  // console.log('YTPB INJECTOR (v15): Sending chapter data for Video ID:', videoData.videoDetails.videoId); // Optional
-                  window.postMessage({
-                    type: 'FROM_PAGE_SCRIPT_CHAPTER_DATA_YTPB',
-                    description: videoData.videoDetails.shortDescription,
-                    durationSeconds: videoData.videoDetails.lengthSeconds,
-                    videoId: videoData.videoDetails.videoId
-                  }, '*');
-                } else {
-                   console.warn('YTPB INJECTOR (v15): Could not get videoData for chapter request.');
-                }
-              });
-            }
-          });
-
-          function getPlayerDataWithRetry(callback, retries = 7, delay = 400) {
-            try {
-              const player = document.querySelector('.html5-video-player');
-              if (player && typeof player.getPlayerResponse === 'function') {
-                const videoData = player.getPlayerResponse();
-                if (videoData && videoData.videoDetails &&
-                    typeof videoData.videoDetails.shortDescription === 'string' &&
-                    typeof videoData.videoDetails.lengthSeconds !== 'undefined' &&
-                    !isNaN(parseFloat(videoData.videoDetails.lengthSeconds)) &&
-                    parseFloat(videoData.videoDetails.lengthSeconds) > 0) {
-                  callback(videoData);
-                  return;
-                }
-              }
-            } catch (e) { /* console.warn('YTPB INJECTOR (v15): Error in getPlayerData attempt.', e); */ } // Keep error for injector if needed
-
-            if (retries > 0) setTimeout(() => getPlayerDataWithRetry(callback, retries - 1, delay), delay);
-            else { callback(null); }
-          }
-        })();
-    `;
-
-    function injectScript(code) {
-        try {
-            const script = document.createElement('script');
-            script.id = "ytpbInjectorScript";
-            script.textContent = code;
-            (document.head || document.documentElement).appendChild(script);
-        } catch (e) {
-            console.error('YTPB Main (v15): CRITICAL - Failed to inject page script:', e);
-        }
-    }
-    // --- End: Injector.js logic ---
+    // --- DEFAULT OPTIONS AND VARIABLES ---
 
     const defaultOptions = {
         enabled: true,
@@ -106,202 +27,379 @@
         bufferOpacity: 1,
         unbufferedColor: '#000000',
         unbufferedOpacity: 1,
-        barHeight: 4, // ZMIANA: Domyślna wysokość paska na 4px
+        barHeight: 3,
         zIndex: 60,
         chaptersEnabled: true,
-        chapterMarkerColor: '#000000' // ZMIANA: Domyślny kolor znaczników na czarny
+        chapterMarkerColor: '#FFFFFF'
     };
 
-    let options = {}; // Zostanie wypełnione przez loadAllOptions
-    let customBar, progressBar, bufferBar, unbufferedBar, chapterMarkersContainer;
-    let currentVideoIdForChapters = null, currentVideoElementForPlayListener = null, videoPlayHandlerTimeoutId = null;
+    let options = {};
+    let customBar, progressBar, bufferBar, unbufferedBar;
+    let chapterMarkersContainer;
+    let currentVideoIdForChapters = null;
+    let animationFrameId = null;
 
-    function loadAllOptions() {
-        for (const key in defaultOptions) {
-            if (defaultOptions.hasOwnProperty(key)) {
-                options[key] = GM_getValue(key, defaultOptions[key]);
-            }
+    // --- STYLES ---
+
+    GM_addStyle(`
+        #custom-progress-bar {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: var(--ytpb-bar-height, 3px);
+            z-index: var(--ytpb-z-index, 60);
+            display: none; /* Initially hidden, controlled by JS */
         }
-        // console.log('YTPB Main (v15): Options loaded.'); // Optional
+        #custom-progress-bar.ytpb-enabled {
+            display: block;
+        }
+        #custom-progress, #custom-buffer, #custom-unbuffered {
+            position: absolute;
+            top: 0;
+            left: 0;
+            height: 100%;
+            width: 0; /* Initially 0 */
+        }
+        #custom-progress {
+            background-color: var(--ytpb-progress-color, #F76400);
+            z-index: 3;
+        }
+        #custom-buffer {
+            background-color: var(--ytpb-buffer-color, #808080);
+            z-index: 2;
+        }
+        #custom-unbuffered {
+            background-color: var(--ytpb-unbuffered-color, #000000);
+            width: 100%;
+            z-index: 1;
+        }
+        #custom-chapter-markers {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 100%;
+            pointer-events: none;
+            z-index: 4;
+        }
+        .custom-chapter-marker {
+            position: absolute;
+            top: 0;
+            width: 2px;
+            height: 100%;
+            background-color: var(--ytpb-chapter-marker-color, #FFFFFF);
+            transform: translateX(-50%);
+        }
+        /* Settings Modal Styles */
+        #ytpb-settings-modal {
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background-color: rgba(0, 0, 0, 0.7);
+            z-index: 99999;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: 'Roboto', 'Arial', sans-serif;
+        }
+        #ytpb-settings-content {
+            background-color: #282828;
+            color: #fff;
+            padding: 20px;
+            border-radius: 12px;
+            width: 400px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        #ytpb-settings-content h2 {
+            margin-top: 0;
+            border-bottom: 1px solid #555;
+            padding-bottom: 10px;
+        }
+        #ytpb-settings-content label {
+            display: block;
+            margin: 15px 0;
+        }
+        #ytpb-settings-content input[type="color"],
+        #ytpb-settings-content input[type="number"],
+        #ytpb-settings-content input[type="range"] {
+            margin-left: 10px;
+            vertical-align: middle;
+        }
+        #ytpb-settings-buttons {
+            margin-top: 20px;
+            text-align: right;
+        }
+        #ytpb-settings-buttons button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            margin-left: 10px;
+            cursor: pointer;
+        }
+        #ytpb-settings-save {
+            background-color: #4CAF50;
+            color: white;
+        }
+        #ytpb-settings-close {
+            background-color: #f44336;
+            color: white;
+        }
+    `);
+
+    // --- OPTIONS MANAGEMENT (GM_setValue / GM_getValue) ---
+
+    function loadOptions() {
+        const savedOptions = GM_getValue('YTPB_options', JSON.stringify(defaultOptions));
+        // Merge saved options with defaults to ensure all keys exist
+        options = { ...defaultOptions, ...JSON.parse(savedOptions) };
     }
 
-    function processChapterData(data) {
-        // console.log('YTPB Main (v15): Processing chapter data...'); // Optional
-        if (!data) {
-            console.warn("YTPB Main (v15): processChapterData called with null/undefined data.");
-            return;
-        }
-        const {description, durationSeconds:rawDuration, videoId} = data;
-        const durationNum = parseFloat(rawDuration);
-
-        if (options.enabled && options.chaptersEnabled && customBar &&
-            description && typeof description === 'string' &&
-            !isNaN(durationNum) && durationNum > 0
-        ) {
-            currentVideoIdForChapters = videoId;
-            drawChapterMarkersLogic(description, durationNum);
-        } else {
-            // console.warn('YTPB Main (v15): Conditions not met for drawing chapters in processChapterData.'); // Optional, can be noisy
-        }
+    function saveOptions() {
+        GM_setValue('YTPB_options', JSON.stringify(options));
     }
 
-    function triggerChapterDataRequestViaPostMessage() {
-        if (!options.chaptersEnabled || !options.enabled || !customBar) { return; }
-        try {
-            // console.log("YTPB Main (v15): Requesting chapter data from injector."); // Optional
-            window.postMessage({type:'REQUEST_CHAPTER_DATA_YTPB_FROM_CONTENT'},'*');
-        } catch(e) {
-            console.warn("YTPB Main (v15): Error posting chapter data request.", e);
-        }
-    }
 
-    function handleVideoPlayEvent(){ if(videoPlayHandlerTimeoutId)clearTimeout(videoPlayHandlerTimeoutId); const s=GM_getValue('enabled',defaultOptions.enabled); if(s===true){GM_setValue('enabled',false); videoPlayHandlerTimeoutId=setTimeout(()=>{GM_setValue('enabled',true);videoPlayHandlerTimeoutId=null;},2000);} }
-    function manageVideoPlayListener(){ const p=document.querySelector('.html5-video-player'),v=p?p.querySelector('video'):null; if(v){if(v!==currentVideoElementForPlayListener){if(currentVideoElementForPlayListener)currentVideoElementForPlayListener.removeEventListener('play',handleVideoPlayEvent); v.addEventListener('play',handleVideoPlayEvent);currentVideoElementForPlayListener=v;}}else if(currentVideoElementForPlayListener){currentVideoElementForPlayListener.removeEventListener('play',handleVideoPlayEvent);currentVideoElementForPlayListener=null;} }
-    function removeVideoPlayListener(){ if(currentVideoElementForPlayListener){currentVideoElementForPlayListener.removeEventListener('play',handleVideoPlayEvent);currentVideoElementForPlayListener=null;} }
+    // --- CORE PROGRESS BAR LOGIC ---
 
     function createProgressBar() {
-        const player=document.querySelector('.html5-video-player');
-        if(!player)return;
-        if(customBar)removeProgressBar();
-        customBar=document.createElement('div');customBar.id='custom-progress-bar-ytpb';
-        progressBar=document.createElement('div');progressBar.id='custom-progress-ytpb';
-        bufferBar=document.createElement('div');bufferBar.id='custom-buffer-ytpb';
-        unbufferedBar=document.createElement('div');unbufferedBar.id='custom-unbuffered-ytpb';
-        customBar.appendChild(unbufferedBar);customBar.appendChild(bufferBar);customBar.appendChild(progressBar);
-        if(options.chaptersEnabled)createChapterMarkersContainer();
+        const player = document.querySelector('.html5-video-player');
+        if (!player || customBar) return;
+
+        customBar = document.createElement('div');
+        customBar.id = 'custom-progress-bar';
+
+        unbufferedBar = document.createElement('div');
+        unbufferedBar.id = 'custom-unbuffered';
+        bufferBar = document.createElement('div');
+        bufferBar.id = 'custom-buffer';
+        progressBar = document.createElement('div');
+        progressBar.id = 'custom-progress';
+
+        customBar.appendChild(unbufferedBar);
+        customBar.appendChild(bufferBar);
+        customBar.appendChild(progressBar);
+
+        if (options.chaptersEnabled) {
+            chapterMarkersContainer = document.createElement('div');
+            chapterMarkersContainer.id = 'custom-chapter-markers';
+            customBar.appendChild(chapterMarkersContainer);
+        }
         player.appendChild(customBar);
-        updateStyles();
     }
+
     function removeProgressBar() {
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+        }
         if (customBar) {
             customBar.remove();
-            customBar = progressBar = bufferBar = unbufferedBar = chapterMarkersContainer = null;
+            customBar = null;
         }
     }
-    function createChapterMarkersContainer() {
-        if(!customBar)return;
-        if(chapterMarkersContainer&&customBar.contains(chapterMarkersContainer))return;
-        if(chapterMarkersContainer)chapterMarkersContainer.remove();
-        chapterMarkersContainer=document.createElement('div');
-        chapterMarkersContainer.id='custom-chapter-markers-ytpb';
-        customBar.appendChild(chapterMarkersContainer);
-    }
 
-    function drawChapterMarkersLogic(description, durationSeconds) {
-        // console.log('YTPB Main (v15): Drawing chapter markers...'); // Optional
-        if(!options.chaptersEnabled || !customBar){ if(chapterMarkersContainer)chapterMarkersContainer.innerHTML=''; return; }
-        if(!chapterMarkersContainer || !customBar.contains(chapterMarkersContainer)){
-            createChapterMarkersContainer();
-            if(!chapterMarkersContainer || !customBar.contains(chapterMarkersContainer)){ console.error('YTPB Main (v15): Failed to ensure chapterMarkersContainer for drawing.'); return; }
+    function updateProgressBar() {
+        if (!options.enabled || !customBar) {
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            return;
         }
-        chapterMarkersContainer.innerHTML = '';
-        chapterMarkersContainer.style.cssText=`position:absolute;bottom:0;left:0;right:0;height:${options.barHeight}px;pointer-events:none;z-index:${(parseInt(options.zIndex)||0)+3};`;
-        if(!description || typeof description!=='string' || !durationSeconds || durationSeconds===0){ /* console.warn('YTPB Main (v15): Invalid desc/duration for drawing markers.'); */ return; }
-        const lines=description.split('\n'),regex=/((?<h>\d{0,2}):)?(?<m>\d{1,2}):(?<s>\d{2})/,ts=[];
-        for(const l of lines){const m=l.match(regex);if(m&&m.groups){const i=m.index+m[0].length,t=l.substring(i).trim();if(t.length>0&&!/^\d/.test(t))ts.push(m.groups);}}
-        // if(ts.length === 0) console.log('YTPB Main (v15): No timestamps extracted.'); // Optional
-        if(ts.length===0)return;
-        const s=o=>(parseInt(o.h)||0)*3600+(parseInt(o.m)||0)*60+(parseInt(o.s)||0);
-        let drawn=0;
-        for(const t of ts){const cs=s(t),p=(cs/durationSeconds)*100;if(cs===0||isNaN(p)||p<=0||p>=100)continue;const m=document.createElement('div');m.className='custom-chapter-marker-ytpb';m.style.cssText=`position:absolute;left:${p}%;top:0;width:2px;height:100%;background-color:${options.chapterMarkerColor};transform:translateX(-50%);`;chapterMarkersContainer.appendChild(m);drawn++;}
-        // console.log(`YTPB Main (v15): Drew ${drawn} markers.`); // Optional
+        const video = document.querySelector('.html5-main-video');
+        if (!video || isNaN(video.duration) || video.duration === 0) {
+            animationFrameId = requestAnimationFrame(updateProgressBar);
+            return;
+        }
+
+        const progressPercent = (video.currentTime / video.duration) * 100;
+        progressBar.style.width = `${progressPercent}%`;
+
+        if (video.buffered.length > 0) {
+            const bufferedTime = video.buffered.end(video.buffered.length - 1);
+            const bufferedPercent = (bufferedTime / video.duration) * 100;
+            bufferBar.style.width = `${bufferedPercent}%`;
+        }
+
+        animationFrameId = requestAnimationFrame(updateProgressBar);
     }
 
-    function updateProgressBar() { if(!options.enabled||!customBar)return;const p=document.querySelector('.html5-video-player video');if(!p||isNaN(p.duration)||p.duration===0)return;if(progressBar)progressBar.style.width=`${(p.currentTime/p.duration)*100}%`;if(p.buffered.length>0&&bufferBar)bufferBar.style.width=`${(p.buffered.end(p.buffered.length-1)/p.duration)*100}%`;requestAnimationFrame(updateProgressBar);}
-    function safeDrawChapterMarkers() { triggerChapterDataRequestViaPostMessage(); }
-    function checkAndAddProgressBar() { const p=document.querySelector('.html5-video-player');if(options.enabled){if(!p){if(customBar)removeProgressBar();removeVideoPlayListener();return;}if(!customBar||!p.contains(customBar))createProgressBar();else updateStyles();updateProgressBar();if(options.chaptersEnabled)safeDrawChapterMarkers();manageVideoPlayListener();}else{removeProgressBar();removeVideoPlayListener();}}
-    function toHex(o){const h=Math.round(o*255).toString(16);return h.length===1?'0'+h:h;}
-    function updateStyles() { if(!customBar)return;customBar.style.cssText=`position:absolute;bottom:0;left:0;right:0;height:${options.barHeight}px;z-index:${options.zIndex};display:${options.enabled?'block':'none'};`;if(progressBar)progressBar.style.cssText=`width:${progressBar.style.width||'0%'};height:100%;background-color:${options.progressColor+toHex(options.progressOpacity)};position:absolute;top:0;left:0;z-index:${(parseInt(options.zIndex)||0)+2};`;if(bufferBar)bufferBar.style.cssText=`width:${bufferBar.style.width||'0%'};height:100%;background-color:${options.bufferColor+toHex(options.bufferOpacity)};position:absolute;top:0;left:0;z-index:${(parseInt(options.zIndex)||0)+1};`;if(unbufferedBar)unbufferedBar.style.cssText=`width:100%;height:100%;background-color:${options.unbufferedColor+toHex(options.unbufferedOpacity)};position:absolute;top:0;left:0;z-index:${parseInt(options.zIndex)||0};`;if(chapterMarkersContainer){chapterMarkersContainer.style.height=`${options.barHeight}px`;chapterMarkersContainer.style.zIndex=(parseInt(options.zIndex)||0)+3;}}
+    // --- CHAPTERS LOGIC (using unsafeWindow) ---
 
-    function initializeExtension() {
-        // console.log("YTPB Main (v15): Initializing extension proper..."); // Optional
-        loadAllOptions();
-        injectScript(injectorScriptCode);
+    function getChapterDataFromPage() {
+        try {
+            const player = unsafeWindow.document.querySelector('.html5-video-player');
+            if (player && typeof player.getPlayerResponse === 'function') {
+                const videoData = player.getPlayerResponse();
+                if (videoData && videoData.videoDetails) {
+                    return {
+                        description: videoData.videoDetails.shortDescription,
+                        durationSeconds: videoData.videoDetails.lengthSeconds,
+                        videoId: videoData.videoDetails.videoId
+                    };
+                }
+            }
+        } catch (e) {
+            console.warn('YTPB: Error getting chapter data from page.', e);
+        }
+        return null;
+    }
 
-        const pageObserver = new MutationObserver(checkAndAddProgressBar);
-        pageObserver.observe(document.body, { childList: true, subtree: true });
-        document.addEventListener('yt-navigate-finish', () => { currentVideoIdForChapters=null; if (chapterMarkersContainer) chapterMarkersContainer.innerHTML = ''; if(videoPlayHandlerTimeoutId){clearTimeout(videoPlayHandlerTimeoutId);videoPlayHandlerTimeoutId=null;} checkAndAddProgressBar(); });
+
+    function drawChapterMarkers() {
+        if (!options.chaptersEnabled || !customBar || !chapterMarkersContainer) {
+            if (chapterMarkersContainer) chapterMarkersContainer.innerHTML = '';
+            return;
+        }
+
+        const chapterData = getChapterDataFromPage();
+        if (!chapterData || !chapterData.description || !chapterData.durationSeconds) {
+            chapterMarkersContainer.innerHTML = '';
+            return;
+        }
+
+        if (chapterData.videoId === currentVideoIdForChapters) return; // Avoid re-drawing for the same video
+        currentVideoIdForChapters = chapterData.videoId;
+        chapterMarkersContainer.innerHTML = ''; // Clear previous
+
+        const lines = chapterData.description.split('\n');
+        const regex = /((?<h>\d{0,2}):)?(?<m>\d{1,2}):(?<s>\d{2})/;
+        const convertToSeconds = (h, m, s) => (parseInt(h) || 0) * 3600 + (parseInt(m) || 0) * 60 + (parseInt(s) || 0);
+
+        for (const line of lines) {
+            const match = line.match(regex);
+            if (match && match.groups) {
+                const chapterTimeSeconds = convertToSeconds(match.groups.h, match.groups.m, match.groups.s);
+                const percent = (chapterTimeSeconds / chapterData.durationSeconds) * 100;
+
+                if (chapterTimeSeconds > 0 && percent < 100) {
+                    const marker = document.createElement('div');
+                    marker.className = 'custom-chapter-marker';
+                    marker.style.left = `${percent}%`;
+                    chapterMarkersContainer.appendChild(marker);
+                }
+            }
+        }
+    }
+
+    // --- MAIN CONTROL FUNCTIONS ---
+
+    function updateStyles() {
+        if (!customBar) return;
+        const root = document.documentElement;
+        root.style.setProperty('--ytpb-progress-color', `${options.progressColor}${Math.round(options.progressOpacity * 255).toString(16).padStart(2, '0')}`);
+        root.style.setProperty('--ytpb-buffer-color', `${options.bufferColor}${Math.round(options.bufferOpacity * 255).toString(16).padStart(2, '0')}`);
+        root.style.setProperty('--ytpb-unbuffered-color', `${options.unbufferedColor}${Math.round(options.unbufferedOpacity * 255).toString(16).padStart(2, '0')}`);
+        root.style.setProperty('--ytpb-chapter-marker-color', options.chapterMarkerColor);
+        root.style.setProperty('--ytpb-bar-height', `${options.barHeight}px`);
+        root.style.setProperty('--ytpb-z-index', options.zIndex);
+    }
+
+    function checkAndAddProgressBar() {
+        const player = document.querySelector('.html5-video-player');
+
+        if (options.enabled && player) {
+            if (!customBar) {
+                createProgressBar();
+            }
+            customBar.classList.add('ytpb-enabled');
+            updateStyles();
+            if (options.chaptersEnabled) {
+                drawChapterMarkers();
+            } else if (chapterMarkersContainer) {
+                chapterMarkersContainer.innerHTML = '';
+            }
+            if (!animationFrameId) {
+                updateProgressBar();
+            }
+        } else {
+            removeProgressBar();
+        }
+    }
+
+    // --- SETTINGS MODAL UI ---
+
+    function openSettingsModal() {
+        if (document.getElementById('ytpb-settings-modal')) return;
+
+        const modalHtml = `
+            <div id="ytpb-settings-content">
+                <h2>Ustawienia Paska Postępu</h2>
+                <label><input type="checkbox" id="ytpb-enabled"> Włącz rozszerzenie</label>
+                <label>Kolor paska postępu: <input type="color" id="ytpb-progressColor"></label>
+                <label>Przezroczystość postępu: <input type="range" id="ytpb-progressOpacity" min="0" max="1" step="0.1"></label>
+                <label>Kolor bufora: <input type="color" id="ytpb-bufferColor"></label>
+                <label>Przezroczystość bufora: <input type="range" id="ytpb-bufferOpacity" min="0" max="1" step="0.1"></label>
+                <label>Kolor tła: <input type="color" id="ytpb-unbufferedColor"></label>
+                <label>Przezroczystość tła: <input type="range" id="ytpb-unbufferedOpacity" min="0" max="1" step="0.1"></label>
+                <label>Wysokość paska (px): <input type="number" id="ytpb-barHeight" min="1" max="50"></label>
+                <label>Warstwa (Z-Index): <input type="number" id="ytpb-zIndex" min="0" max="9999"></label>
+                <label><input type="checkbox" id="ytpb-chaptersEnabled"> Włącz znaczniki rozdziałów</label>
+                <label>Kolor znaczników: <input type="color" id="ytpb-chapterMarkerColor"></label>
+                <div id="ytpb-settings-buttons">
+                    <button id="ytpb-settings-save">Zapisz i Zamknij</button>
+                    <button id="ytpb-settings-close">Anuluj</button>
+                </div>
+            </div>
+        `;
+        const modal = document.createElement('div');
+        modal.id = 'ytpb-settings-modal';
+        modal.innerHTML = modalHtml;
+        document.body.appendChild(modal);
+
+        // Populate fields with current options
+        for (const key in options) {
+            const el = document.getElementById(`ytpb-${key}`);
+            if (el) {
+                if (el.type === 'checkbox') el.checked = options[key];
+                else el.value = options[key];
+            }
+        }
+
+        // Add event listeners
+        document.getElementById('ytpb-settings-close').addEventListener('click', () => modal.remove());
+        document.getElementById('ytpb-settings-save').addEventListener('click', () => {
+            for (const key in options) {
+                const el = document.getElementById(`ytpb-${key}`);
+                if (el) {
+                    if (el.type === 'checkbox') options[key] = el.checked;
+                    else if (el.type === 'number' || el.type === 'range') options[key] = Number(el.value);
+                    else options[key] = el.value;
+                }
+            }
+            saveOptions();
+            checkAndAddProgressBar(); // Re-render with new options
+            modal.remove();
+        });
+    }
+
+    // --- INITIALIZATION ---
+
+    function initialize() {
+        loadOptions();
+
+        // Observe for player appearing/disappearing and other DOM changes
+        const observer = new MutationObserver(() => checkAndAddProgressBar());
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        // Handle YouTube's SPA navigation
+        document.addEventListener('yt-navigate-finish', () => {
+            currentVideoIdForChapters = null; // Reset for new page
+            // Give player time to appear
+            setTimeout(checkAndAddProgressBar, 500);
+        });
+
+        // Register menu command for settings
+        GM_registerMenuCommand('Ustawienia Paska Postępu', openSettingsModal);
+
+        // Initial check
         checkAndAddProgressBar();
-        // console.log("YTPB Main (v15): Extension proper initialized."); // Optional
     }
 
-    Object.keys(defaultOptions).forEach(optionKey => { GM_addValueChangeListener(optionKey,(name,old_value,new_value,remote)=>{options[name]=new_value;if(name==='enabled'){if(new_value===false&&videoPlayHandlerTimeoutId){clearTimeout(videoPlayHandlerTimeoutId);videoPlayHandlerTimeoutId=null;}checkAndAddProgressBar();}else if(name==='chaptersEnabled'){if(options.enabled)checkAndAddProgressBar();}else if(name==='chapterMarkerColor'||name==='barHeight'){if(options.enabled&&options.chaptersEnabled&&customBar)safeDrawChapterMarkers();}else if(options.enabled&&customBar)updateStyles();});});
-
-    if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', initializeExtension); }
-    else { initializeExtension(); }
-
-    // --- Settings UI (Formatted) ---
-    function showSettingsDialog() {
-        const existingDialog = document.getElementById("ytpb-settings-dialog");
-        if (existingDialog) existingDialog.remove();
-        const dialog = document.createElement("div");
-        dialog.id = "ytpb-settings-dialog";
-        dialog.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background-color:#282828;color:#eee;padding:25px;border-radius:10px;box-shadow:0 5px 20px rgba(0,0,0,0.6);z-index:20000;width:380px;max-height:90vh;overflow-y:auto;font-family:'YouTube Noto',Roboto,Arial,Helvetica,sans-serif;border:1px solid #444;";
-        let html = `<h2 style="margin-top:0;margin-bottom:20px;text-align:center;border-bottom:1px solid #555;padding-bottom:12px;font-size:1.3em;font-weight:500;">YT Progress Bar Settings</h2>`;
-        const fields = [
-            {id:"enabled",label:"Enable Bar",type:"checkbox"},
-            {id:"progressColor",label:"Progress color:",type:"color"},
-            {id:"progressOpacity",label:"Progress opacity:",type:"range",min:0,max:1,step:.01},
-            {id:"bufferColor",label:"Buffer color:",type:"color"},
-            {id:"bufferOpacity",label:"Buffer opacity:",type:"range",min:0,max:1,step:.01},
-            {id:"unbufferedColor",label:"Background color:",type:"color"},
-            {id:"unbufferedOpacity",label:"Background opacity:",type:"range",min:0,max:1,step:.01},
-            {id:"barHeight",label:"Bar height (px):",type:"number",min:1,max:50},
-            {id:"zIndex",label:"Z-Index:",type:"number",min:0,max:99999},
-            {id:"chaptersEnabled",label:"Enable Chapters",type:"checkbox"},
-            {id:"chapterMarkerColor",label:"Chapter marker color:",type:"color"}
-        ];
-        fields.forEach(f => {
-            html += `<div style="margin-bottom:15px;display:flex;flex-direction:column;">`;
-            const lStyle="display:block;margin-bottom:6px;font-size:0.95em;color:#ccc;";
-            const iStyle="width:100%;box-sizing:border-box;padding:8px;background-color:#333;color:#eee;border:1px solid #555;border-radius:4px;font-size:0.9em;";
-            if(f.type==='checkbox'){
-                html+=`<label style="display:flex;align-items:center;cursor:pointer;${lStyle}"><input type="${f.type}" id="ytpb-opt-${f.id}" data-key="${f.id}" style="margin-right:10px;height:18px;width:18px;accent-color:#F76400;">${f.label}</label>`;
-            } else {
-                html+=`<label for="ytpb-opt-${f.id}" style="${lStyle}">${f.label}</label><div style="display:flex;align-items:center;"><input type="${f.type}" id="ytpb-opt-${f.id}" data-key="${f.id}" ${f.min!==undefined?`min="${f.min}"`:''} ${f.max!==undefined?`max="${f.max}"`:''} ${f.step!==undefined?`step="${f.step}"`:''} style="${iStyle} ${f.type==='color'?'padding:2px 4px;height:35px;':''} ${f.type==='range'?'flex-grow:1;':''}">${f.type==='range'?`<span id="ytpb-val-${f.id}" style="margin-left:12px;font-size:0.9em;color:#bbb;min-width:30px;text-align:right;"></span>`:''}</div>`;
-            }
-            html+=`</div>`;
-        });
-        html += `<button id="ytpb-close-settings" style="padding:10px 18px;background-color:#4CAF50;color:white;border:none;border-radius:4px;cursor:pointer;display:block;margin:25px auto 0;font-size:1em;font-weight:500;">Close</button>`;
-        dialog.innerHTML = html;
-        document.body.appendChild(dialog);
-
-        let timeout;
-        const save = (k,v)=>{clearTimeout(timeout);timeout=setTimeout(()=>GM_setValue(k,v),300);};
-
-        fields.forEach(f=>{
-            const el=document.getElementById(`ytpb-opt-${f.id}`);
-            const val=GM_getValue(f.id,defaultOptions[f.id]);
-            if(f.type==='checkbox') el.checked=val;
-            else el.value=val;
-
-            if(f.type==='range'){
-                const disp=document.getElementById(`ytpb-val-${f.id}`);
-                if(disp) disp.textContent=parseFloat(val).toFixed(2);
-            }
-            el.addEventListener('input',e=>{
-                let v=e.target.value;
-                if(f.type==='checkbox') v=e.target.checked;
-                else if(f.type==='number'||f.type==='range'){
-                    v=parseFloat(e.target.value);
-                    if(isNaN(v)&&f.type==='number'){
-                        v=defaultOptions[f.id];
-                        e.target.value=v;
-                    }
-                }
-                if(f.type==='range'){
-                    const disp=document.getElementById(`ytpb-val-${f.id}`);
-                    if(disp&&!isNaN(v)) disp.textContent=v.toFixed(2);
-                }
-                if(!isNaN(v)||typeof v==='boolean'||f.type==='color') save(f.id,v);
-            });
-        });
-        const closeBtn=document.getElementById('ytpb-close-settings');
-        const close=()=>{dialog.remove();document.removeEventListener('keydown',esc);};
-        closeBtn.addEventListener('click',close);
-        const esc=(e)=>{if(e.key==="Escape")close();};
-        document.addEventListener('keydown',esc);
+    // Wait for the DOM to be ready before starting
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initialize);
+    } else {
+        initialize();
     }
-    GM_registerMenuCommand("ProgressBar Settings", showSettingsDialog);
 
 })();
